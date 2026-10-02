@@ -1,0 +1,646 @@
+-- ================================================================
+-- DARK HUB — AUTO FARM + BOSS CARRIER ULTIMATE + DARK ARSENAL
+-- ARQUIVO TXT DE INTEGRAÇÃO
+-- ================================================================
+
+-- ================================================================
+-- DARK HUB — AUTO FARM + BOSS CARRIER ULTIMATE
+-- ================================================================
+-- BASE ORIGINAL FOR INTEGRATION
+-- ================================================================
+
+-- Cole aqui o código-base DARK HUB + BOSS CARRIER ULTIMATE fornecido
+-- na conversa. Abaixo está o módulo completo do DARK ARSENAL integrado.
+
+
+-- ================================================================
+-- INTEGRAÇÃO DA ABA NO FLUENT
+-- ================================================================
+-- Se quiser um botão dentro do Fluent para abrir/fechar o Arsenal,
+-- adicione DEPOIS de criar "Window":
+
+local ArsenalTab = Window:AddTab({
+    Title = "🔫 Arsenal",
+    Icon = "solar/armchair-bold"
+})
+
+ArsenalTab:AddSection("🔫 DARK ARSENAL")
+
+ArsenalTab:AddButton({
+    Title = "ABRIR / FECHAR ARSENAL",
+    Callback = function()
+        if ArsenalMain.Visible then
+            ArsenalCloseMenu()
+        else
+            ArsenalOpen()
+        end
+    end
+})
+
+ArsenalTab:AddButton({
+    Title = "🔄 ATUALIZAR ARMAS",
+    Callback = function()
+        ArsenalRebuild()
+    end
+})
+
+ArsenalTab:AddToggle("ArsenalAutoPickup", {
+    Title = "AUTO PICKUP",
+    Default = false,
+    Callback = function(v)
+        ArsenalAuto = v
+        if v then
+            ArsenalAutoButton.Text = "AUTO PICKUP: LIGADO"
+            ArsenalAutoButton.BackgroundColor3 = Color3.fromRGB(35,65,48)
+        else
+            ArsenalAutoButton.Text = "AUTO PICKUP: DESLIGADO"
+            ArsenalAutoButton.BackgroundColor3 = Color3.fromRGB(29,31,38)
+        end
+    end
+})
+
+
+-- ================================================================
+-- DARK ARSENAL — ABA 🔫 ARSENAL
+-- INTEGRADO AO DARK HUB
+-- ================================================================
+-- Regras:
+-- • Usa workspace.pickups
+-- • Não cria Tool/arma falsa
+-- • Detecta ProximityPrompt e ClickDetector reais
+-- • Lista somente armas conhecidas que realmente existem
+-- • Seleção individual
+-- • Puxar personagem até o pickup
+-- • Auto Pickup
+-- • Pegar todas
+-- • Botão flutuante para reabrir o menu principal
+-- • Insert alterna o DARK HUB
+--
+-- IMPORTANTE:
+-- Um LocalScript não pode inventar uma entrega de Tool pelo servidor.
+-- Se o jogo exigir RemoteEvent/RemoteFunction para conceder a arma,
+-- o nome/contrato real precisa existir no jogo. Este código não inventa
+-- remotes.
+-- ================================================================
+
+local ArsenalPlayers = game:GetService("Players")
+local ArsenalUIS = game:GetService("UserInputService")
+local ArsenalRun = game:GetService("RunService")
+local ArsenalPlayer = ArsenalPlayers.LocalPlayer
+local ArsenalGuiParent = ArsenalPlayer:WaitForChild("PlayerGui")
+
+local ARSENAL_PICKUPS = "pickups"
+
+local ARSENAL_WEAPONS = {
+    "AK-74","AR 15","AWM","DB Shotgun","FAL","Famas","Flaregun",
+    "Glock","LMG","M1 Carabine","M4","M40","M60","M9","M9A1","M79",
+    "MP5","Micro AK","Minigun","P90","PDW","SCAR-H","SPAS","TEC-9",
+    "Thompson","UZI","Luger","Taser","Baton","Bat","Hammer","Knife",
+    "Scissors","Screwdriver","Riot Shield","Frag","C4"
+}
+
+local ArsenalWeaponSet = {}
+for _, name in ipairs(ARSENAL_WEAPONS) do
+    ArsenalWeaponSet[string.lower(name)] = true
+end
+
+local ArsenalSelected = nil
+local ArsenalAuto = false
+local ArsenalBusy = false
+local ArsenalDestroyed = false
+
+local function ArsenalCharacter()
+    return ArsenalPlayer.Character
+end
+
+local function ArsenalRoot()
+    local c = ArsenalCharacter()
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function ArsenalFolder()
+    return workspace:FindFirstChild(ARSENAL_PICKUPS)
+end
+
+local function ArsenalFindPickup(name)
+    local folder = ArsenalFolder()
+    if not folder then return nil end
+
+    local exact = folder:FindFirstChild(name)
+    if exact and ArsenalWeaponSet[string.lower(exact.Name)] then
+        return exact
+    end
+
+    local wanted = string.lower(name)
+    for _, obj in ipairs(folder:GetChildren()) do
+        if string.lower(obj.Name) == wanted then
+            return obj
+        end
+    end
+end
+
+local function ArsenalPrimary(obj)
+    if not obj then return nil end
+    if obj:IsA("BasePart") then return obj end
+
+    if obj:IsA("Model") then
+        if obj.PrimaryPart then return obj.PrimaryPart end
+
+        local handle = obj:FindFirstChild("Handle", true)
+        if handle and handle:IsA("BasePart") then
+            return handle
+        end
+
+        local hitbox = obj:FindFirstChild("hitbox", true)
+        if hitbox and hitbox:IsA("BasePart") then
+            return hitbox
+        end
+
+        return obj:FindFirstChildWhichIsA("BasePart", true)
+    end
+
+    return obj:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function ArsenalPrompt(obj)
+    if not obj then return nil end
+    return obj:FindFirstChildWhichIsA("ProximityPrompt", true)
+end
+
+local function ArsenalClick(obj)
+    if not obj then return nil end
+    return obj:FindFirstChildWhichIsA("ClickDetector", true)
+end
+
+local function ArsenalMoveNear(part)
+    local hrp = ArsenalRoot()
+    if not hrp or not part then return false end
+
+    return pcall(function()
+        local cf = part.CFrame
+        hrp.CFrame =
+            cf
+            - cf.LookVector * 3
+            + Vector3.new(0, 2, 0)
+    end)
+end
+
+-- Há uma limitação importante: InputHoldBegin/InputHoldEnd de
+-- ProximityPrompt não são garantidos como uma API de simulação de
+-- entrada no cliente em todas as experiências. O código tenta de forma
+-- protegida; se não funcionar, o status explica que é necessário usar
+-- a interação normal.
+local function ArsenalTryPrompt(prompt)
+    if not prompt or not prompt:IsA("ProximityPrompt") then
+        return false, "Prompt inválido."
+    end
+
+    local ok = pcall(function()
+        prompt:InputHoldBegin()
+
+        local duration = tonumber(prompt.HoldDuration) or 0
+        task.wait(math.max(duration, 0.1) + 0.08)
+
+        prompt:InputHoldEnd()
+    end)
+
+    if ok then
+        return true, "ProximityPrompt processado."
+    end
+
+    return false, "O Prompt existe, mas a ativação automática foi recusada pelo cliente."
+end
+
+local function ArsenalPickupOne(name)
+    local pickup = ArsenalFindPickup(name)
+    if not pickup then
+        return false, "Pickup não encontrado: " .. tostring(name)
+    end
+
+    local part = ArsenalPrimary(pickup)
+    if part then
+        ArsenalMoveNear(part)
+        task.wait(0.15)
+    end
+
+    local prompt = ArsenalPrompt(pickup)
+    if prompt then
+        return ArsenalTryPrompt(prompt)
+    end
+
+    local detector = ArsenalClick(pickup)
+    if detector then
+        return false, "Este pickup usa ClickDetector; clique nele normalmente."
+    end
+
+    return false, "Nenhum ProximityPrompt/ClickDetector encontrado."
+end
+
+-- ================================================================
+-- GUI DA ABA ARSENAL
+-- ================================================================
+
+local oldArsenal = ArsenalGuiParent:FindFirstChild("DarkArsenalIntegrated")
+if oldArsenal then oldArsenal:Destroy() end
+
+local ArsenalGui = Instance.new("ScreenGui")
+ArsenalGui.Name = "DarkArsenalIntegrated"
+ArsenalGui.ResetOnSpawn = false
+ArsenalGui.IgnoreGuiInset = true
+ArsenalGui.Parent = ArsenalGuiParent
+
+local function ArsenalCorner(obj, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius)
+    c.Parent = obj
+end
+
+local function ArsenalStroke(obj)
+    local s = Instance.new("UIStroke")
+    s.Thickness = 1
+    s.Transparency = 0.3
+    s.Parent = obj
+end
+
+local ArsenalMain = Instance.new("Frame")
+ArsenalMain.Size = UDim2.fromOffset(430, 500)
+ArsenalMain.Position = UDim2.new(0.5, -215, 0.5, -250)
+ArsenalMain.BackgroundColor3 = Color3.fromRGB(12,13,17)
+ArsenalMain.BorderSizePixel = 0
+ArsenalMain.Parent = ArsenalGui
+ArsenalCorner(ArsenalMain, 15)
+ArsenalStroke(ArsenalMain)
+
+local ArsenalHeader = Instance.new("Frame")
+ArsenalHeader.Size = UDim2.new(1,0,0,60)
+ArsenalHeader.BackgroundColor3 = Color3.fromRGB(20,22,28)
+ArsenalHeader.BorderSizePixel = 0
+ArsenalHeader.Parent = ArsenalMain
+ArsenalCorner(ArsenalHeader, 15)
+
+local ArsenalTitle = Instance.new("TextLabel")
+ArsenalTitle.BackgroundTransparency = 1
+ArsenalTitle.Position = UDim2.fromOffset(17,7)
+ArsenalTitle.Size = UDim2.new(1,-170,0,27)
+ArsenalTitle.Text = "DARK ARSENAL"
+ArsenalTitle.Font = Enum.Font.GothamBlack
+ArsenalTitle.TextSize = 20
+ArsenalTitle.TextColor3 = Color3.fromRGB(255,255,255)
+ArsenalTitle.TextXAlignment = Enum.TextXAlignment.Left
+ArsenalTitle.Parent = ArsenalHeader
+
+local ArsenalSub = Instance.new("TextLabel")
+ArsenalSub.BackgroundTransparency = 1
+ArsenalSub.Position = UDim2.fromOffset(18,34)
+ArsenalSub.Size = UDim2.new(1,-180,0,17)
+ArsenalSub.Text = "REAL PICKUP • INTEGRADO"
+ArsenalSub.Font = Enum.Font.Gotham
+ArsenalSub.TextSize = 10
+ArsenalSub.TextColor3 = Color3.fromRGB(145,150,160)
+ArsenalSub.TextXAlignment = Enum.TextXAlignment.Left
+ArsenalSub.Parent = ArsenalHeader
+
+local ArsenalClose = Instance.new("TextButton")
+ArsenalClose.Size = UDim2.fromOffset(72,36)
+ArsenalClose.Position = UDim2.new(1,-82,0,12)
+ArsenalClose.Text = "FECHAR"
+ArsenalClose.Font = Enum.Font.GothamBlack
+ArsenalClose.TextSize = 11
+ArsenalClose.TextColor3 = Color3.fromRGB(255,255,255)
+ArsenalClose.BackgroundColor3 = Color3.fromRGB(45,47,54)
+ArsenalClose.BorderSizePixel = 0
+ArsenalClose.Parent = ArsenalHeader
+ArsenalCorner(ArsenalClose,9)
+
+local ArsenalContent = Instance.new("Frame")
+ArsenalContent.BackgroundTransparency = 1
+ArsenalContent.Position = UDim2.fromOffset(14,70)
+ArsenalContent.Size = UDim2.new(1,-28,1,-82)
+ArsenalContent.Parent = ArsenalMain
+
+local ArsenalSelectedLabel = Instance.new("TextLabel")
+ArsenalSelectedLabel.BackgroundTransparency = 1
+ArsenalSelectedLabel.Size = UDim2.new(1,0,0,28)
+ArsenalSelectedLabel.Text = "ARMA: nenhuma"
+ArsenalSelectedLabel.Font = Enum.Font.GothamBold
+ArsenalSelectedLabel.TextSize = 14
+ArsenalSelectedLabel.TextColor3 = Color3.fromRGB(240,240,245)
+ArsenalSelectedLabel.TextXAlignment = Enum.TextXAlignment.Left
+ArsenalSelectedLabel.Parent = ArsenalContent
+
+local ArsenalList = Instance.new("ScrollingFrame")
+ArsenalList.Position = UDim2.fromOffset(0,32)
+ArsenalList.Size = UDim2.new(1,0,0,270)
+ArsenalList.BackgroundColor3 = Color3.fromRGB(18,19,24)
+ArsenalList.BorderSizePixel = 0
+ArsenalList.ScrollBarThickness = 5
+ArsenalList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+ArsenalList.CanvasSize = UDim2.new()
+ArsenalList.Parent = ArsenalContent
+ArsenalCorner(ArsenalList,10)
+ArsenalStroke(ArsenalList)
+
+local ArsenalPad = Instance.new("UIPadding")
+ArsenalPad.PaddingTop = UDim.new(0,8)
+ArsenalPad.PaddingLeft = UDim.new(0,8)
+ArsenalPad.PaddingRight = UDim.new(0,8)
+ArsenalPad.PaddingBottom = UDim.new(0,8)
+ArsenalPad.Parent = ArsenalList
+
+local ArsenalLayout = Instance.new("UIListLayout")
+ArsenalLayout.Padding = UDim.new(0,5)
+ArsenalLayout.Parent = ArsenalList
+
+local ArsenalButtons = {}
+
+local function ArsenalClearButtons()
+    for _, b in ipairs(ArsenalButtons) do
+        b:Destroy()
+    end
+    table.clear(ArsenalButtons)
+end
+
+local function ArsenalStatus(message, good)
+    ArsenalStatusLabel.Text = "Status: " .. tostring(message)
+    ArsenalStatusLabel.TextColor3 =
+        good and Color3.fromRGB(90,255,145)
+        or Color3.fromRGB(235,125,125)
+end
+
+local function ArsenalAddButton(name)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(1,0,0,34)
+    b.BackgroundColor3 = Color3.fromRGB(28,30,36)
+    b.BorderSizePixel = 0
+    b.Text = "  " .. name
+    b.TextColor3 = Color3.fromRGB(235,235,240)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 12
+    b.TextXAlignment = Enum.TextXAlignment.Left
+    b.Parent = ArsenalList
+    ArsenalCorner(b,8)
+
+    b.MouseButton1Click:Connect(function()
+        ArsenalSelected = name
+        ArsenalSelectedLabel.Text = "ARMA: " .. name
+
+        for _, other in ipairs(ArsenalButtons) do
+            other.BackgroundColor3 = Color3.fromRGB(28,30,36)
+        end
+
+        b.BackgroundColor3 = Color3.fromRGB(48,58,75)
+    end)
+
+    table.insert(ArsenalButtons,b)
+end
+
+ArsenalStatusLabel = Instance.new("TextLabel")
+ArsenalStatusLabel.Position = UDim2.fromOffset(0,309)
+ArsenalStatusLabel.Size = UDim2.new(1,0,0,24)
+ArsenalStatusLabel.BackgroundTransparency = 1
+ArsenalStatusLabel.Text = "Status: pronto"
+ArsenalStatusLabel.TextColor3 = Color3.fromRGB(150,155,165)
+ArsenalStatusLabel.Font = Enum.Font.Gotham
+ArsenalStatusLabel.TextSize = 11
+ArsenalStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+ArsenalStatusLabel.Parent = ArsenalContent
+
+local function ArsenalButton(text,y)
+    local b = Instance.new("TextButton")
+    b.Position = UDim2.fromOffset(0,y)
+    b.Size = UDim2.new(1,0,0,38)
+    b.BackgroundColor3 = Color3.fromRGB(29,31,38)
+    b.BorderSizePixel = 0
+    b.Text = text
+    b.TextColor3 = Color3.fromRGB(240,240,245)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 12
+    b.Parent = ArsenalContent
+    ArsenalCorner(b,9)
+    ArsenalStroke(b)
+    return b
+end
+
+local ArsenalGet = ArsenalButton("PEGAR ARMA SELECIONADA",340)
+local ArsenalAll = ArsenalButton("PEGAR TODAS AS ARMAS",384)
+local ArsenalAutoButton = ArsenalButton("AUTO PICKUP: DESLIGADO",428)
+
+local ArsenalFloating = Instance.new("TextButton")
+ArsenalFloating.Size = UDim2.fromOffset(105,48)
+ArsenalFloating.Position = UDim2.new(0,20,0.5,-24)
+ArsenalFloating.BackgroundColor3 = Color3.fromRGB(16,17,22)
+ArsenalFloating.BorderSizePixel = 0
+ArsenalFloating.Text = "ABRIR • DA"
+ArsenalFloating.TextColor3 = Color3.fromRGB(255,255,255)
+ArsenalFloating.Font = Enum.Font.GothamBlack
+ArsenalFloating.TextSize = 12
+ArsenalFloating.Visible = false
+ArsenalFloating.Parent = ArsenalGui
+ArsenalCorner(ArsenalFloating,12)
+ArsenalStroke(ArsenalFloating)
+
+local function ArsenalOpen()
+    ArsenalMain.Visible = true
+    ArsenalFloating.Visible = false
+end
+
+local function ArsenalCloseMenu()
+    ArsenalMain.Visible = false
+    ArsenalFloating.Visible = true
+end
+
+ArsenalClose.MouseButton1Click:Connect(ArsenalCloseMenu)
+ArsenalFloating.MouseButton1Click:Connect(ArsenalOpen)
+
+ArsenalGet.MouseButton1Click:Connect(function()
+    if ArsenalBusy then return end
+    if not ArsenalSelected then
+        ArsenalStatus("selecione uma arma.", false)
+        return
+    end
+
+    ArsenalBusy = true
+    ArsenalStatus("tentando pegar " .. ArsenalSelected .. "...", true)
+
+    local ok,msg = ArsenalPickupOne(ArsenalSelected)
+    ArsenalStatus(msg, ok)
+    ArsenalBusy = false
+end)
+
+ArsenalAll.MouseButton1Click:Connect(function()
+    if ArsenalBusy then return end
+
+    ArsenalBusy = true
+    ArsenalStatus("processando pickups...", true)
+
+    local success,failed = 0,0
+
+    for _,name in ipairs(ARSENAL_WEAPONS) do
+        local ok = ArsenalPickupOne(name)
+        if ok then
+            success += 1
+        else
+            failed += 1
+        end
+        task.wait(0.12)
+    end
+
+    ArsenalStatus(
+        ("concluído: %d processadas / %d indisponíveis"):format(success,failed),
+        success > 0
+    )
+
+    ArsenalBusy = false
+end)
+
+ArsenalAutoButton.MouseButton1Click:Connect(function()
+    ArsenalAuto = not ArsenalAuto
+
+    if ArsenalAuto then
+        ArsenalAutoButton.Text = "AUTO PICKUP: LIGADO"
+        ArsenalAutoButton.BackgroundColor3 = Color3.fromRGB(35,65,48)
+        ArsenalStatus("auto pickup ligado.",true)
+    else
+        ArsenalAutoButton.Text = "AUTO PICKUP: DESLIGADO"
+        ArsenalAutoButton.BackgroundColor3 = Color3.fromRGB(29,31,38)
+        ArsenalStatus("auto pickup desligado.",true)
+    end
+end)
+
+local function ArsenalRebuild()
+    ArsenalClearButtons()
+
+    local folder = ArsenalFolder()
+    local found = {}
+
+    if folder then
+        for _,obj in ipairs(folder:GetChildren()) do
+            if ArsenalWeaponSet[string.lower(obj.Name)] then
+                table.insert(found,obj.Name)
+            end
+        end
+    end
+
+    table.sort(found,function(a,b)
+        return string.lower(a) < string.lower(b)
+    end)
+
+    for _,name in ipairs(found) do
+        ArsenalAddButton(name)
+    end
+
+    if #found == 0 then
+        ArsenalSelectedLabel.Text = "ARMA: nenhum pickup encontrado"
+        ArsenalStatus("workspace.pickups sem armas conhecidas.",false)
+        return
+    end
+
+    if not ArsenalSelected or not ArsenalWeaponSet[string.lower(ArsenalSelected)] then
+        ArsenalSelected = found[1]
+        ArsenalSelectedLabel.Text = "ARMA: " .. ArsenalSelected
+    end
+
+    ArsenalStatus(#found .. " pickups encontrados.",true)
+end
+
+task.spawn(function()
+    while not ArsenalDestroyed do
+        if ArsenalAuto and not ArsenalBusy then
+            local folder = ArsenalFolder()
+
+            if folder then
+                for _,obj in ipairs(folder:GetChildren()) do
+                    if ArsenalAuto and ArsenalWeaponSet[string.lower(obj.Name)] then
+                        local part = ArsenalPrimary(obj)
+                        local hrp = ArsenalRoot()
+
+                        if part and hrp then
+                            local dist = (part.Position-hrp.Position).Magnitude
+
+                            if dist <= 80 then
+                                ArsenalBusy = true
+                                ArsenalPickupOne(obj.Name)
+                                task.wait(0.15)
+                                ArsenalBusy = false
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        task.wait(0.5)
+    end
+end)
+
+local ArsenalFolderNow = ArsenalFolder()
+if ArsenalFolderNow then
+    ArsenalFolderNow.ChildAdded:Connect(function()
+        task.wait()
+        ArsenalRebuild()
+    end)
+
+    ArsenalFolderNow.ChildRemoved:Connect(function()
+        task.wait()
+        ArsenalRebuild()
+    end)
+end
+
+-- ================================================================
+-- DRAG DO ARSENAL
+-- ================================================================
+
+local function ArsenalDraggable(handle,object)
+    local dragging=false
+    local dragStart
+    local startPosition
+    local dragInput
+
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+
+            dragging=true
+            dragStart=input.Position
+            startPosition=object.Position
+
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging=false
+                end
+            end)
+        end
+    end)
+
+    handle.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput=input
+        end
+    end)
+
+    ArsenalUIS.InputChanged:Connect(function(input)
+        if dragging and input == dragInput then
+            local delta=input.Position-dragStart
+
+            object.Position=UDim2.new(
+                startPosition.X.Scale,
+                startPosition.X.Offset+delta.X,
+                startPosition.Y.Scale,
+                startPosition.Y.Offset+delta.Y
+            )
+        end
+    end)
+end
+
+ArsenalDraggable(ArsenalHeader,ArsenalMain)
+ArsenalDraggable(ArsenalFloating,ArsenalFloating)
+
+ArsenalRebuild()
+ArsenalOpen()
+
+print("[DARK ARSENAL] Aba integrada carregada.")
+
+-- ================================================================
+-- FIM DO DARK ARSENAL INTEGRADO
+-- ================================================================
